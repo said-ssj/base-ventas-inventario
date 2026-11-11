@@ -1,0 +1,136 @@
+package com.ventas.integration;
+import com.ventas.service.*;import com.ventas.repository.*;import com.ventas.dto.SaleModels.*;import com.ventas.dto.SaleModels.Details;import com.ventas.dto.SaleModels.Line;import com.ventas.dto.CashModels.Open;import com.ventas.dto.ProductModels.*;import com.ventas.dto.PurchaseModels.*;import com.ventas.security.AuthModels.Identity;import com.ventas.security.AuthFailure;import java.math.BigDecimal;import java.time.*;import java.util.*;import org.junit.jupiter.api.*;import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;import org.springframework.beans.factory.annotation.Autowired;import org.springframework.boot.test.context.SpringBootTest;import org.springframework.core.env.Environment;import org.springframework.jdbc.core.JdbcTemplate;import org.springframework.test.context.ActiveProfiles;import org.springframework.transaction.annotation.Transactional;import static org.assertj.core.api.Assertions.*;
+@SpringBootTest @ActiveProfiles({"local","db"}) @Transactional @EnabledIfEnvironmentVariable(named="NEGOCIO_DB_INTEGRATION",matches="true")
+class AuditWorkflowDatabaseTest {
+ @Autowired DispatchService dispatch;@Autowired CreditService credits;@Autowired ReturnService returns; @Autowired OfferService offers; @Autowired InventoryService inventory;@Autowired SaleService service;@Autowired ProductService products;@Autowired PurchaseService purchases;@Autowired CashService cash;@Autowired CatalogService catalog;@Autowired CustomerService customers;@Autowired AuthStore auth;@Autowired Environment env;@Autowired JdbcTemplate jdbc;Identity actor;long category;String unique;BigDecimal n(String s){return new BigDecimal(s);}
+ @BeforeEach void setup(){Assumptions.assumeTrue(jdbc.queryForObject("select count(*) from negocio.caja_diaria where estado_caja='ABIERTA' or fecha=timezone('America/Lima',now())::date",Long.class)==0,"No interferir con cajas reales");var u=auth.lockUsername(env.getRequiredProperty("BOOTSTRAP_ADMIN_USUARIO")).orElseThrow();auth.context(u.username(),"INTEGRATION_ROLLBACK");UUID token=UUID.randomUUID();auth.createSession(u.id(),token,LocalDateTime.now(ZoneId.of("America/Lima")));actor=new Identity(u.id(),u.username(),u.nombres(),u.apellidos(),u.rol(),false,auth.permissions(u.id()),token,OffsetDateTime.now().plusMinutes(30));unique="INTEGRACION_"+UUID.randomUUID().toString().substring(0,8).toUpperCase();category=catalog.createCategory(actor,"INTEGRATION_ROLLBACK",new com.ventas.dto.CatalogModels.CategoryInput(unique,null,null)).id();cash.open(actor,"INTEGRATION_ROLLBACK",new Open(n("0"),null,UUID.randomUUID()));jdbc.update("update negocio.parametro_sistema set valor='Negocio de integración' where clave='NEGOCIO.RAZON_SOCIAL'");jdbc.update("update negocio.parametro_sistema set valor='20123456789' where clave='NEGOCIO.RUC'");jdbc.update("update negocio.parametro_sistema set valor='Dirección temporal 123' where clave='NEGOCIO.DIRECCION'");}
+ Product product(String mode,String unitCode){long unit=jdbc.queryForObject("select id_unidad from negocio.unidad_medida where codigo_sunat=?",Long.class,unitCode);return products.create(actor,"INTEGRATION_ROLLBACK",new ProductInput(unique+mode.substring(0,1),"Producto "+mode,null,category,unit,true,n("0.001"),n("0.001"),mode,n("0"),null,"Base",n("10"),null));}
+ long presentation(Product p){return products.details(actor,p.id()).presentaciones().getFirst().id();}
+ long id(Details d){return ((Number)d.venta().get("id")).longValue();}
+ Details create(long presentation,String qty,int pieces,String type,Long client){return service.create(actor,"INTEGRATION_ROLLBACK",new Create(client,type,true,UUID.randomUUID(),List.of(new Line(presentation,n(qty),pieces))));}
+ long series(String type){return jdbc.queryForObject("select min(id_serie) from negocio.serie_comprobante where tipo_comprobante=? and estado='A'",Long.class,type);}
+ Confirm request(Details d,List<Payment> payments,List<Assignment> assignments){return new Confirm(series(d.venta().get("tipo").toString()),LocalDateTime.parse(d.venta().get("version").toString()),payments,assignments);}
+ Payment pay(String medium,String amount,String received,String operation){return new Payment(medium,n(amount),received==null?null:n(received),operation,null,null);}
+
+ com.ventas.dto.ReturnModels.SolicitRequest returnRequest(Details sale,boolean auto,List<Map<String,Object>> units,String qty){
+   long line=((Number)sale.lineas().getFirst().get("id")).longValue();
+   return new com.ventas.dto.ReturnModels.SolicitRequest(id(sale),"EFECTIVO","Producto retornado por el comprador",List.of(new com.ventas.dto.ReturnModels.ReturnItemRequest(line,n(qty),"APTO",units)),UUID.randomUUID(),auto,auto?cash.current().caja().id():null,null,null);
+ }
+ Details paid(Product p,String qty,String total,List<Assignment> assignments){
+   var d=create(presentation(p),qty,1,"N",null);
+   return service.confirm(actor,"INTEGRATION_ROLLBACK",id(d),request(d,List.of(pay("EFECTIVO",total,total,null)),assignments));
+ }
+ @Test void returnedBulkUpdatesStockCashAndReplaysApproval(){
+   var p=product("GRANEL","KGM");purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("10"),n("1"),UUID.randomUUID(),List.of()));
+   var sale=paid(p,"1","10",List.of());
+   assertThat(returns.getSaleDetail(actor,id(sale)).items()).hasSize(1);
+   var req=returnRequest(sale,false,List.of(),"1");var pending=returns.solicitar(actor,"INTEGRATION_ROLLBACK",req);
+   assertThat(returns.solicitar(actor,"INTEGRATION_ROLLBACK",req).cabecera().id()).isEqualTo(pending.cabecera().id());
+   var approve=new com.ventas.dto.ReturnModels.ApproveRequest(cash.current().caja().id(),UUID.randomUUID(),null,"Producto recibido en buen estado");
+   var result=returns.aprobar(actor,"INTEGRATION_ROLLBACK",pending.cabecera().id(),approve);
+   assertThat(result.cabecera().estadoDevolucion()).isEqualTo("APROBADA");
+   assertThat(returns.aprobar(actor,"INTEGRATION_ROLLBACK",pending.cabecera().id(),approve).cabecera().id()).isEqualTo(result.cabecera().id());
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("10.000000");assertThat(cash.current().caja().efectivo()).isEqualTo("0.00");
+   assertThat(returns.detail(actor,result.cabecera().id()).items()).hasSize(1);
+   jdbc.execute("set constraints all immediate");
+   assertThatThrownBy(()->returns.aprobar(actor,"INTEGRATION_ROLLBACK",pending.cabecera().id(),new com.ventas.dto.ReturnModels.ApproveRequest(approve.cajaId(),approve.clave(),null,"Otra observación"))).isInstanceOf(AuthFailure.class);
+ }
+ @Test void autoApprovalReplaysWithoutRepeatingStockOrMoney(){
+   var p=product("GRANEL","KGM");purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("10"),n("1"),UUID.randomUUID(),List.of()));var sale=paid(p,"1","10",List.of());
+   var req=returnRequest(sale,true,List.of(),"1");var result=returns.solicitar(actor,"INTEGRATION_ROLLBACK",req);
+   assertThat(result.cabecera().estadoDevolucion()).isEqualTo("APROBADA");assertThat(returns.solicitar(actor,"INTEGRATION_ROLLBACK",req).cabecera().id()).isEqualTo(result.cabecera().id());
+   assertThat(jdbc.queryForObject("select count(*) from negocio.devolucion where id_venta=?",Long.class,id(sale))).isEqualTo(1);
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("10.000000");assertThat(cash.current().caja().efectivo()).isEqualTo("0.00");jdbc.execute("set constraints all immediate");
+ }
+ @Test void rejectionReplaysWithoutReturningStock(){
+   var p=product("GRANEL","KGM");purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("10"),n("1"),UUID.randomUUID(),List.of()));var sale=paid(p,"1","10",List.of());var pending=returns.solicitar(actor,"INTEGRATION_ROLLBACK",returnRequest(sale,false,List.of(),"1"));
+   var req=new com.ventas.dto.ReturnModels.RejectRequest(UUID.randomUUID(),"La revisión no autoriza el retorno");var result=returns.rechazar(actor,"INTEGRATION_ROLLBACK",pending.cabecera().id(),req);
+   assertThat(result.cabecera().estadoDevolucion()).isEqualTo("RECHAZADA");assertThat(returns.rechazar(actor,"INTEGRATION_ROLLBACK",pending.cabecera().id(),req).cabecera().id()).isEqualTo(result.cabecera().id());
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("9.000000");assertThat(cash.current().caja().efectivo()).isEqualTo("10.00");jdbc.execute("set constraints all immediate");
+ }
+ @Test void intactBagReturnsWithItsPhysicalPresentation(){
+   var p=product("ENVASES","KGM");var bag=products.savePresentation(actor,"INTEGRATION_ROLLBACK",p.id(),null,new PresentationInput("Bolsa",null,n("50"),true,false,n("1"),n("1"),n("300"),null));
+   purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("50"),n("1"),UUID.randomUUID(),List.of(new PhysicalUnit(unique,"ENVASE",n("50"),bag.id()))));long unit=purchases.existences(p.id(),0,20).items().getFirst().id();var d=create(bag.id(),"1",1,"N",null);long line=((Number)d.lineas().getFirst().get("id")).longValue();var sale=service.confirm(actor,"INTEGRATION_ROLLBACK",id(d),request(d,List.of(pay("EFECTIVO","300","300",null)),List.of(new Assignment(line,unit,1,n("50")))));
+   assertThat(returns.getSaleDetail(actor,id(sale)).items().getFirst().presentacionesRetorno()).anyMatch(pr->pr.id()==bag.id());
+   var result=returns.solicitar(actor,"INTEGRATION_ROLLBACK",returnRequest(sale,true,List.of(Map.of("condicion","ENVASE","cantidad",n("50"),"id_presentacion",bag.id())),"1"));
+   assertThat(result.cabecera().estadoDevolucion()).isEqualTo("APROBADA");assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("50.000000");jdbc.execute("set constraints all immediate");
+ }
+ @Test void separateReturnedSegmentsRemainSeparatePhysicalUnits(){
+   var p=product("TRAMOS","MTR");purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("10"),n("1"),UUID.randomUUID(),List.of(new PhysicalUnit(unique,"TRAMO",n("10"),presentation(p)))));long unit=purchases.existences(p.id(),0,20).items().getFirst().id();var d=create(presentation(p),"2",1,"N",null);long line=((Number)d.lineas().getFirst().get("id")).longValue();var sale=service.confirm(actor,"INTEGRATION_ROLLBACK",id(d),request(d,List.of(pay("EFECTIVO","20","20",null)),List.of(new Assignment(line,unit,1,n("2")))));
+   var result=returns.solicitar(actor,"INTEGRATION_ROLLBACK",returnRequest(sale,true,List.of(Map.of("condicion","TRAMO","cantidad",n("0.5")),Map.of("condicion","TRAMO","cantidad",n("1.5"))),"2"));
+   assertThat(result.cabecera().estadoDevolucion()).isEqualTo("APROBADA");assertThat(jdbc.queryForObject("select count(*) from negocio.unidad_existencia where id_detalle_devolucion=?",Long.class,result.items().getFirst().id())).isEqualTo(2);assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("10.000000");jdbc.execute("set constraints all immediate");
+ }
+ @Test void offersUsePresentationCostForBagsAndFractionsAndEnforceVersions(){
+   var p=product("GRANEL","KGM");purchases.opening(actor,"INTEGRATION_ROLLBACK",new Opening(p.id(),n("100"),n("2"),UUID.randomUUID(),List.of()));
+   var bag=products.savePresentation(actor,"INTEGRATION_ROLLBACK",p.id(),null,new PresentationInput("Bolsa 50 kg",null,n("50"),true,false,n("1"),n("1"),n("300"),null));
+   var small=products.savePresentation(actor,"INTEGRATION_ROLLBACK",p.id(),null,new PresentationInput("100 gramos",null,n("0.1"),true,false,n("1"),n("1"),n("1"),null));
+   LocalDate day=LocalDate.now(ZoneId.of("America/Lima"));var created=offers.create(actor,"INTEGRATION_ROLLBACK",new com.ventas.dto.OfferModels.OfferCreateRequest(p.id(),small.id(),"Oferta porción",n("0.80"),day,day.plusDays(2)));
+   assertThat(created.costoReferencial()).isEqualTo("0.20");
+   var edited=offers.update(actor,"INTEGRATION_ROLLBACK",created.id(),new com.ventas.dto.OfferModels.OfferUpdateRequest("Oferta porción revisada",n("0.70"),day,day.plusDays(3),created.version()));
+   var inactive=offers.changeState(actor,"INTEGRATION_ROLLBACK",edited.id(),new com.ventas.dto.OfferModels.OfferStateRequest("I",edited.version()));
+   assertThat(offers.changeState(actor,"INTEGRATION_ROLLBACK",inactive.id(),new com.ventas.dto.OfferModels.OfferStateRequest("A",inactive.version())).estadoLogico()).isEqualTo("A");
+   jdbc.execute("set constraints all immediate");
+   assertThatThrownBy(()->offers.create(actor,"INTEGRATION_ROLLBACK",new com.ventas.dto.OfferModels.OfferCreateRequest(p.id(),bag.id(),"Bolsa bajo costo",n("20"),day,day.plusDays(1)))).isInstanceOf(AuthFailure.class).hasMessageContaining("costo");
+   assertThatThrownBy(()->offers.update(actor,"INTEGRATION_ROLLBACK",created.id(),new com.ventas.dto.OfferModels.OfferUpdateRequest("Sin versión",n("0.60"),day,day.plusDays(2),null))).isInstanceOf(AuthFailure.class);
+   assertThatThrownBy(()->offers.changeState(actor,"INTEGRATION_ROLLBACK",created.id(),new com.ventas.dto.OfferModels.OfferStateRequest("I",created.version().minusSeconds(1)))).isInstanceOf(AuthFailure.class);
+ }
+ // Full service boundaries, using the same contracts as the HTTP controllers.
+ Product receivedFromPurchaseOrder(){
+   var p=product("GRANEL","KGM");long pres=presentation(p);
+   String ruc="20"+String.format("%09d",Math.floorMod(UUID.randomUUID().getLeastSignificantBits(),1000000000L));
+   long supplier=purchases.saveSupplier(actor,"INTEGRATION_ROLLBACK",null,new SupplierInput(ruc,unique,null,null,null,null,null)).id();
+   var order=purchases.save(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.ORDER,null,new DocumentInput(supplier,LocalDate.now(ZoneId.of("America/Lima")),null,null,null,null,null,UUID.randomUUID()));
+   order=purchases.saveLine(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.ORDER,order.documento().id(),null,new LineInput(p.id(),pres,n("10"),n("4"),null,null,null,order.documento().version()));
+   order=purchases.process(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.ORDER,order.documento().id(),new Action(UUID.randomUUID(),order.documento().version(),null),false);
+   var receipt=purchases.save(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.RECEIPT,null,new DocumentInput(supplier,LocalDate.now(ZoneId.of("America/Lima")),null,order.documento().id(),unique,null,null,UUID.randomUUID()));
+   receipt=purchases.saveLine(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.RECEIPT,receipt.documento().id(),null,new LineInput(p.id(),pres,n("10"),n("4"),order.lineas().getFirst().id(),"GRANEL",null,receipt.documento().version()));
+   UUID key=UUID.randomUUID();var action=new Action(key,receipt.documento().version(),null);
+   purchases.process(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.RECEIPT,receipt.documento().id(),action,false);
+   purchases.process(actor,"INTEGRATION_ROLLBACK",com.ventas.repository.PurchaseRepository.Kind.RECEIPT,receipt.documento().id(),action,false);
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("10.000000");
+   assertThat(products.details(actor,p.id()).producto().costoPromedio()).isEqualTo("4.000000");
+   assertThat(purchases.details(com.ventas.repository.PurchaseRepository.Kind.ORDER,order.documento().id()).documento().estado()).isEqualTo("COMPLETA");
+   return p;
+ }
+ @Test void purchaseReceiptSaleDispatchReturnAndCashCloseStayConsistent(){
+   var p=receivedFromPurchaseOrder();
+   var draft=service.create(actor,"INTEGRATION_ROLLBACK",new Create(null,"N",false,UUID.randomUUID(),List.of(new Line(presentation(p),n("2"),1))));
+   var sale=service.confirm(actor,"INTEGRATION_ROLLBACK",id(draft),request(draft,List.of(pay("EFECTIVO","20","20",null)),List.of()));
+   long dispatchId=jdbc.queryForObject("select id_despacho from negocio.despacho where id_venta=?",Long.class,id(sale));
+   assertThat(dispatch.detail(actor,dispatchId).despacho().estado()).isEqualTo("PENDIENTE");
+   var prepare=new com.ventas.dto.DispatchModels.PrepareRequest(UUID.randomUUID(),"Contenido comprobado en prueba");
+   dispatch.preparar(actor,"INTEGRATION_ROLLBACK",dispatchId,prepare);dispatch.preparar(actor,"INTEGRATION_ROLLBACK",dispatchId,prepare);
+   var deliver=new com.ventas.dto.DispatchModels.DeliverRequest(UUID.randomUUID(),"Receptor de integración","Entrega completa de prueba");
+   dispatch.entregar(actor,"INTEGRATION_ROLLBACK",dispatchId,deliver);dispatch.entregar(actor,"INTEGRATION_ROLLBACK",dispatchId,deliver);
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("8.000000");
+   var req=returnRequest(sale,true,List.of(),"1");var result=returns.solicitar(actor,"INTEGRATION_ROLLBACK",req);
+   assertThat(returns.solicitar(actor,"INTEGRATION_ROLLBACK",req).cabecera().id()).isEqualTo(result.cabecera().id());
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("9.000000");
+   assertThat(purchases.movements(actor,p.id(),0,20).total()).isEqualTo(3);
+   var current=cash.current().caja();assertThat(current.efectivo()).isEqualTo("10.00");
+   cash.close(actor,"INTEGRATION_ROLLBACK",current.id(),new com.ventas.dto.CashModels.Close(n("10"),n("0"),n("0"),"Cierre de integración",UUID.randomUUID()));
+   assertThat(cash.current().caja().estado()).isEqualTo("CERRADA");assertThat(cash.current().caja().diferenciaEfectivo()).isEqualTo("0.00");
+   jdbc.execute("set constraints all immediate");
+ }
+ @Test void purchasedStockCreditSaleAndRepeatedPaymentsCloseTheAccountAndCash(){
+   var p=receivedFromPurchaseOrder();String doc=String.format("%08d",Math.floorMod(UUID.randomUUID().getLeastSignificantBits(),89999999L)+10000000L);
+   var client=customers.save(actor,"INTEGRATION_ROLLBACK",null,new com.ventas.dto.CustomerModels.Input("DNI",doc,"Cliente de integración "+unique,null,null,null,null));
+   customers.credit(actor,"INTEGRATION_ROLLBACK",client.id(),new com.ventas.dto.CustomerModels.Credit(n("500"),client.version()));
+   var draft=create(presentation(p),"2",1,"N",client.id());
+   service.confirm(actor,"INTEGRATION_ROLLBACK",id(draft),request(draft,List.of(pay("CREDITO","20",null,null)),List.of()));
+   var statement=credits.statement(actor,client.id());assertThat(statement.cliente().deudaTotal()).isEqualByComparingTo("20");
+   long account=((Number)statement.cuentas().getFirst().get("id")).longValue();
+   var first=new com.ventas.dto.CreditModels.RegisterPayment(account,n("5"),"EFECTIVO",UUID.randomUUID(),null,null,null,"Abono de integración");
+   var receipt=credits.registerPayment(actor,"INTEGRATION_ROLLBACK",first);assertThat(credits.registerPayment(actor,"INTEGRATION_ROLLBACK",first).id()).isEqualTo(receipt.id());
+   assertThat(credits.statement(actor,client.id()).cliente().deudaTotal()).isEqualByComparingTo("15");
+   credits.registerPayment(actor,"INTEGRATION_ROLLBACK",new com.ventas.dto.CreditModels.RegisterPayment(account,n("15"),"EFECTIVO",UUID.randomUUID(),null,null,null,"Liquidación de integración"));
+   assertThat(credits.statement(actor,client.id()).cliente().deudaTotal()).isEqualByComparingTo("0");
+   assertThat(products.details(actor,p.id()).producto().stockActual()).isEqualTo("8.000000");
+   var current=cash.current().caja();assertThat(current.efectivo()).isEqualTo("20.00");
+   cash.close(actor,"INTEGRATION_ROLLBACK",current.id(),new com.ventas.dto.CashModels.Close(n("20"),n("0"),n("0"),"Cierre de integración",UUID.randomUUID()));
+   assertThat(cash.current().caja().diferenciaEfectivo()).isEqualTo("0.00");jdbc.execute("set constraints all immediate");
+ }
+ @org.springframework.test.context.transaction.AfterTransaction
+ void verifiesFixtureWasRolledBack(){if(unique!=null)assertThat(jdbc.queryForObject("select count(*) from negocio.categoria where nombre=?",Long.class,unique)).isZero();}
+
+}
